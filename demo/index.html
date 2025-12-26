@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Three.js MorphTarget 人脸动画演示</title>
+  <style>
+    body { 
+      margin: 0; 
+      background: #666; 
+      overflow: hidden; 
+      font-family: Arial, sans-serif;
+    }
+    #info { 
+      position: absolute; 
+      top: 10px; 
+      left: 10px; 
+      color: white; 
+      z-index: 1; 
+    }
+  </style>
+</head>
+<body>
+  <div id="info">
+    three.js - MorphTarget 人脸表情动画<br/>
+    使用右侧控制面板调节表情
+  </div>
+
+  <!-- Three.js ES模块导入映射 -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+  
+  <!-- lil-gui：用于创建控制面板 -->
+  <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.21.0/dist/lil-gui.umd.min.js"></script>
+
+  <script type="module">
+    // ==================== 导入Three.js相关模块 ====================
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';  // 轨道控制器：用于相机交互
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';          // GLTF加载器：加载3D模型
+    import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';          // KTX2加载器：加载压缩纹理
+    import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js'; // Meshopt解码器：解压缩几何体
+
+    // ==================== 全局变量声明 ====================
+    let scene, camera, renderer, clock, mixer, controls;  // Three.js基础对象
+    let headMesh = null;                    // 包含BlendShape的头部网格对象
+    let morphTargetInfluences = null;       // BlendShape影响值数组（控制表情强度）
+    let morphTargetDictionary = null;       // BlendShape名称到索引的映射字典
+    let speechAnimation = null;             // 说话动画控制器
+    let expressionAnimation = null;         // 表情动画控制器
+    let blinkInterval = null;               // 眨眼定时器
+    
+    // ==================== 动画相关 ====================
+    let animations = [];                    // 存储模型自带的所有动画
+    let currentAction = null;               // 当前播放的动画动作
+    let animationClips = {};                // 动画剪辑映射表
+    
+    // ==================== 动画控制开关 ====================
+    let autoAnimationEnabled = false;       // 自动动画总开关（默认关闭）
+    let manualControlActive = false;        // 手动控制模式标志
+    let animationMode = 'none';             // 动画模式：'none'无动画, 'builtin'内置动画, 'speech'说话动画
+
+    // ==================== 初始化和启动 ====================
+    init();     // 初始化场景
+    animate();  // 启动渲染循环
+
+    /**
+     * 初始化函数：设置场景、相机、渲染器、光照和加载模型
+     */
+    function init() {
+      // 创建时钟对象，用于计算帧间隔时间
+      clock = new THREE.Clock();
+
+      // ========== 创建场景 ==========
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x666666);  // 设置灰色背景
+
+      // ========== 创建相机 ==========
+      // 透视相机：视野角度45度，宽高比，近裁剪面0.1，远裁剪面100
+      camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+      camera.position.set(-1.8, 0.8, 3);  // 初始相机位置
+
+      // ========== 创建渲染器 ==========
+      renderer = new THREE.WebGLRenderer({ antialias: true });  // 开启抗锯齿
+      renderer.setSize(window.innerWidth, window.innerHeight);  // 设置渲染尺寸
+      document.body.appendChild(renderer.domElement);           // 将渲染画布添加到页面
+
+      // ========== 创建轨道控制器 ==========
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;  // 开启阻尼（惯性），使控制更平滑
+
+      // ========== 添加光照 ==========
+      // 环境光：提供基础照明
+      const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambient);
+
+      // 平行光1：从右上方照射
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      directionalLight.position.set(5, 5, 5);
+      scene.add(directionalLight);
+      
+      // 平行光2：从左下方补光
+      const directionalLight2 = new THREE.DirectionalLight(0xffffff, 0.4);
+      directionalLight2.position.set(-5, -5, -5);
+      scene.add(directionalLight2);
+      
+      // ========== 添加辅助网格（用于调试，可选） ==========
+      const gridHelper = new THREE.GridHelper(10, 10);  // 10x10网格
+      scene.add(gridHelper);
+      
+      // 坐标轴辅助：红色X轴，绿色Y轴，蓝色Z轴
+      const axesHelper = new THREE.AxesHelper(5);
+      scene.add(axesHelper);
+
+      // ========== 配置GLTF加载器 ==========
+      const loader = new GLTFLoader();
+      
+      // 配置KTX2纹理加载器（用于压缩纹理）
+      const ktx2Loader = new KTX2Loader();
+      ktx2Loader.setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/basis/');
+      ktx2Loader.detectSupport(renderer);
+      loader.setKTX2Loader(ktx2Loader);
+      
+      // 配置Meshopt解码器（用于压缩几何体）
+      loader.setMeshoptDecoder(MeshoptDecoder);
+      
+      // ========== 加载GLB模型 ==========
+      loader.load(
+        './models/facecap.glb',  // 模型路径
+        
+        // 加载成功回调
+        function(gltf) {
+          console.log('✓ 模型加载成功');
+          
+          // ===== 分析GLTF JSON结构，查找BlendShape信息 =====
+          console.log('\n========== GLB BlendShape 分析 ==========');
+          analyzeGLTFBlendShapes(gltf);
+          
+          // ===== 将模型添加到场景 =====
+          scene.add(gltf.scene);
+
+          // ===== 计算模型边界框并居中 =====
+          const box = new THREE.Box3().setFromObject(gltf.scene);
+          const center = box.getCenter(new THREE.Vector3());
+          const size = box.getSize(new THREE.Vector3());
+          
+          // 将模型移动到原点
+          gltf.scene.position.set(-center.x, -center.y, -center.z);
+
+          // ===== 自动调整相机位置以适应模型 =====
+          const maxDim = Math.max(size.x, size.y, size.z);
+          const fov = camera.fov * (Math.PI / 180);
+          let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+          cameraZ *= 2;  // 添加一些边距
+          
+          camera.position.set(0, 0, cameraZ);
+          camera.lookAt(0, 0, 0);
+          controls.target.set(0, 0, 0);
+          controls.update();
+          
+          // ===== 遍历模型查找包含BlendShape的网格 =====
+          console.log('\n========== Three.js 网格分析 ==========');
+          gltf.scene.traverse(function(child) {
+            if(child.isMesh) {
+              analyzeAndSetupMorphTargets(child);
+            }
+          });
+          console.log('==========================================\n');
+          
+          // ===== 设置动画混合器（如果模型包含动画） =====
+          mixer = new THREE.AnimationMixer(gltf.scene);
+          animations = gltf.animations;  // 保存所有动画
+          
+          if(animations.length > 0) {
+            console.log(`✓ 发现 ${animations.length} 个模型自带动画:`);
+            
+            // 列出所有动画并创建映射
+            animations.forEach((clip, index) => {
+              const clipName = clip.name || `动画_${index}`;
+              animationClips[clipName] = clip;
+              console.log(`  [${index}] ${clipName} (时长: ${clip.duration.toFixed(2)}秒)`);
+            });
+            
+            // 默认不自动播放，等待用户选择
+          } else {
+            console.log('模型不包含预设动画');
+          }
+
+          // ===== 如果找到了包含BlendShape的网格，初始化控制系统 =====
+          if(headMesh) {
+            console.log('✓ BlendShape初始化完成');
+            
+            // 初始化说话动画系统
+            initSpeechAnimation();
+            
+            // 初始化表情动画系统
+            initExpressionAnimation();
+            
+            // 创建GUI控制面板
+            createGUI();
+            
+            // 注意：不自动启动动画，让用户手动控制
+            // 如果需要自动开始，取消下面的注释：
+            /*
+            setTimeout(() => {
+              if(autoAnimationEnabled) {
+                startBlinking();
+                if(speechAnimation) {
+                  speechAnimation.startTalking();
+                }
+              }
+            }, 1000);
+            */
+          } else {
+            console.error('✗ 未找到包含MorphTarget的网格！');
+            alert('模型中未找到BlendShape/MorphTarget数据，无法播放表情动画。');
+          }
+        },
+        
+        // 加载进度回调
+        function(progress) {
+          const percent = (progress.loaded / progress.total * 100).toFixed(2);
+          console.log(`加载进度: ${percent}%`);
+        },
+        
+        // 加载失败回调
+        function(error) { 
+          console.error('✗ 模型加载失败:', error); 
+          alert('模型加载失败，请检查文件路径和格式。');
+        }
+      );
+
+      // ========== 监听窗口大小变化 ==========
+      window.addEventListener('resize', onWindowResize);
+    }
+
+    /**
+     * 分析GLTF文件中的BlendShape信息
+     */
+    function analyzeGLTFBlendShapes(gltf) {
+      if(!gltf.parser || !gltf.parser.json) return;
+      
+      const json = gltf.parser.json;
+      
+      if(json.meshes) {
+        console.log(`发现 ${json.meshes.length} 个网格`);
+        
+        json.meshes.forEach((mesh, meshIndex) => {
+          if(mesh.primitives) {
+            mesh.primitives.forEach((primitive, primIndex) => {
+              if(primitive.targets && primitive.targets.length > 0) {
+                console.log(`  网格 ${meshIndex} - 图元 ${primIndex}: ${primitive.targets.length} 个BlendShape`);
+                
+                // 检查是否有BlendShape名称
+                if(primitive.extras && primitive.extras.targetNames) {
+                  console.log('  BlendShape名称:', primitive.extras.targetNames);
+                } else {
+                  console.log('  (未命名BlendShape，将使用索引)');
+                }
+              }
+            });
+          }
+        });
+      }
+    }
+
+    /**
+     * 分析并设置网格的MorphTarget
+     */
+    function analyzeAndSetupMorphTargets(child) {
+      console.log(`\n网格: ${child.name || '未命名'}`);
+      
+      // 检查几何体是否有morphAttributes
+      if(!child.geometry || !child.geometry.morphAttributes) {
+        console.log('  ✗ 无morphAttributes');
+        return;
+      }
+      
+      const morphAttributes = child.geometry.morphAttributes;
+      
+      // 检查position类型的morph attributes（最常见）
+      if(!morphAttributes.position || morphAttributes.position.length === 0) {
+        console.log('  ✗ 无position morph attributes');
+        return;
+      }
+      
+      const morphCount = morphAttributes.position.length;
+      console.log(`  ✓ 发现 ${morphCount} 个BlendShape`);
+      
+      // ===== 初始化morphTargetInfluences数组 =====
+      if(!child.morphTargetInfluences || child.morphTargetInfluences.length === 0) {
+        child.morphTargetInfluences = new Array(morphCount).fill(0);
+        console.log('  ✓ 初始化morphTargetInfluences数组');
+      }
+      
+      // ===== 创建或获取morphTargetDictionary =====
+      if(!child.morphTargetDictionary) {
+        child.morphTargetDictionary = {};
+        
+        // 尝试从userData获取名称
+        if(child.geometry.userData && child.geometry.userData.morphTargetNames) {
+          child.geometry.userData.morphTargetNames.forEach((name, index) => {
+            child.morphTargetDictionary[name] = index;
+          });
+        } else {
+          // 创建默认名称
+          for(let i = 0; i < morphCount; i++) {
+            child.morphTargetDictionary[`blendshape_${i}`] = i;
+          }
+        }
+      }
+      
+      // ===== 使用第一个找到的包含BlendShape的网格 =====
+      if(!headMesh) {
+        headMesh = child;
+        morphTargetInfluences = child.morphTargetInfluences;
+        morphTargetDictionary = child.morphTargetDictionary;
+        
+        console.log('  ✓ 已选择为头部网格');
+        console.log('  BlendShape列表:');
+        
+        // 按索引排序并打印所有BlendShape名称
+        const sortedEntries = Object.entries(morphTargetDictionary).sort((a, b) => a[1] - b[1]);
+        sortedEntries.forEach(([name, index]) => {
+          console.log(`    [${index}] ${name}`);
+        });
+      }
+    }
+
+    /**
+     * 初始化说话动画系统
+     * 根据BlendShape名称匹配常见的音素形状
+     */
+    function initSpeechAnimation() {
+      if(!headMesh || !morphTargetInfluences) return;
+
+      // 常见音素对应的BlendShape名称（可根据实际模型调整）
+      const phonemes = {
+        'A': ['A', 'a', 'ah', 'open', 'jawOpen', 'mouthOpen', 'aa'],
+        'E': ['E', 'e', 'eh', 'smile', 'mouthSmile', 'ee'],
+        'I': ['I', 'i', 'ee', 'mouthNarrow', 'ii'],
+        'O': ['O', 'o', 'oh', 'mouthRound', 'oo'],
+        'U': ['U', 'u', 'oo', 'mouthPucker', 'uu'],
+        'M': ['M', 'm', 'mouthClose', 'lipsTogether', 'pp'],
+      };
+
+      // 查找音素对应的BlendShape索引
+      const phonemeIndices = {};
+      for(const [phoneme, names] of Object.entries(phonemes)) {
+        for(const name of names) {
+          // 精确匹配
+          if(morphTargetDictionary[name] !== undefined) {
+            phonemeIndices[phoneme] = morphTargetDictionary[name];
+            break;
+          }
+          // 模糊匹配（不区分大小写）
+          for(const [key, index] of Object.entries(morphTargetDictionary)) {
+            if(key.toLowerCase().includes(name.toLowerCase())) {
+              phonemeIndices[phoneme] = index;
+              break;
+            }
+          }
+          if(phonemeIndices[phoneme] !== undefined) break;
+        }
+      }
+
+      console.log('音素映射:', phonemeIndices);
+      
+      // 如果没有找到匹配的音素，使用前几个BlendShape作为备用
+      if(Object.keys(phonemeIndices).length === 0 && morphTargetInfluences.length > 0) {
+        console.warn('未找到匹配的音素名称，使用前几个BlendShape作为备用');
+        const fallbackPhonemes = ['A', 'E', 'I', 'O', 'U', 'M'];
+        fallbackPhonemes.forEach((phoneme, i) => {
+          if(i < morphTargetInfluences.length) {
+            phonemeIndices[phoneme] = i;
+          }
+        });
+      }
+
+      // ===== 说话动画控制器对象 =====
+      speechAnimation = {
+        phonemes: phonemeIndices,           // 音素到索引的映射
+        isSpeaking: false,                  // 是否正在说话
+        currentPhoneme: null,               // 当前音素
+        speed: 0.15,                        // 说话速度（秒/音素）
+        intensity: 0.8,                     // 说话强度
+        allMorphIndices: Array.from({length: morphTargetInfluences.length}, (_, i) => i),
+        
+        /**
+         * 播放音素序列
+         */
+        speak: function(phonemeSequence) {
+          if(!this.isSpeaking && autoAnimationEnabled) {
+            this.isSpeaking = true;
+            this.playSequence(phonemeSequence, 0);
+          }
+        },
+        
+        /**
+         * 递归播放音素序列
+         */
+        playSequence: function(sequence, index) {
+          if(index >= sequence.length || !autoAnimationEnabled) {
+            this.isSpeaking = false;
+            this.resetMouth();
+            return;
+          }
+          
+          const phoneme = sequence[index];
+          this.setPhoneme(phoneme);
+          
+          setTimeout(() => {
+            this.playSequence(sequence, index + 1);
+          }, this.speed * 1000);
+        },
+        
+        /**
+         * 设置当前音素
+         */
+        setPhoneme: function(phoneme) {
+          if(!autoAnimationEnabled || manualControlActive) return;
+          if(this.phonemes[phoneme] === undefined) return;
+          
+          this.resetMouth();
+          morphTargetInfluences[this.phonemes[phoneme]] = this.intensity;
+          this.currentPhoneme = phoneme;
+        },
+        
+        /**
+         * 重置嘴部形状
+         */
+        resetMouth: function() {
+          if(manualControlActive) return;
+          
+          for(const index of Object.values(this.phonemes)) {
+            if(index !== undefined) {
+              morphTargetInfluences[index] = 0;
+            }
+          }
+          this.currentPhoneme = null;
+        },
+        
+        /**
+         * 开始连续说话动画
+         */
+        startTalking: function() {
+          if(this.isSpeaking || !autoAnimationEnabled) return;
+          this.isSpeaking = true;
+          manualControlActive = false;
+          this.talkLoop();
+        },
+        
+        /**
+         * 停止说话动画
+         */
+        stopTalking: function() {
+          this.isSpeaking = false;
+          this.resetMouth();
+        },
+        
+        /**
+         * 说话动画循环
+         */
+        talkLoop: function() {
+          if(!this.isSpeaking || !autoAnimationEnabled || manualControlActive) {
+            this.isSpeaking = false;
+            return;
+          }
+          
+          // 随机选择音素
+          const randomPhonemes = Object.keys(this.phonemes);
+          if(randomPhonemes.length === 0) return;
+          
+          const randomPhoneme = randomPhonemes[Math.floor(Math.random() * randomPhonemes.length)];
+          this.setPhoneme(randomPhoneme);
+          
+          // 随机停顿，更自然
+          const pause = this.speed * 1000 + (Math.random() * 100);
+          
+          setTimeout(() => {
+            if(this.isSpeaking && autoAnimationEnabled) {
+              this.resetMouth();
+              setTimeout(() => this.talkLoop(), 50);
+            }
+          }, pause);
+        }
+      };
+    }
+
+    /**
+     * 初始化表情动画系统
+     */
+    function initExpressionAnimation() {
+      if(!headMesh || !morphTargetInfluences) return;
+
+      // 常见表情对应的BlendShape名称
+      const expressions = {
+        'smile': ['smile', 'happy', 'joy', 'grin', 'mouthSmile'],
+        'frown': ['frown', 'sad', 'sadness', 'mouthFrown'],
+        'surprise': ['surprise', 'surprised', 'shock', 'eyebrowUp', 'browUp'],
+        'anger': ['anger', 'angry', 'mad', 'furious', 'browDown'],
+        'blink': ['blink', 'wink', 'eyeClose', 'eyesClosed'],
+      };
+
+      // 查找表情对应的BlendShape索引
+      const expressionIndices = {};
+      for(const [expression, names] of Object.entries(expressions)) {
+        for(const name of names) {
+          if(morphTargetDictionary[name] !== undefined) {
+            expressionIndices[expression] = morphTargetDictionary[name];
+            break;
+          }
+          for(const [key, index] of Object.entries(morphTargetDictionary)) {
+            if(key.toLowerCase().includes(name.toLowerCase())) {
+              expressionIndices[expression] = index;
+              break;
+            }
+          }
+          if(expressionIndices[expression] !== undefined) break;
+        }
+      }
+
+      console.log('表情映射:', expressionIndices);
+
+      // ===== 表情动画控制器对象 =====
+      expressionAnimation = {
+        expressions: expressionIndices,
+        currentExpression: null,
+        intensity: 0.8,
+        
+        /**
+         * 设置表情
+         */
+        setExpression: function(expression, value = null) {
+          if(this.expressions[expression] !== undefined) {
+            const targetValue = value !== null ? value : this.intensity;
+            morphTargetInfluences[this.expressions[expression]] = targetValue;
+            this.currentExpression = expression;
+          }
+        },
+        
+        /**
+         * 清除指定表情
+         */
+        clearExpression: function(expression) {
+          if(this.expressions[expression] !== undefined) {
+            morphTargetInfluences[this.expressions[expression]] = 0;
+          }
+        },
+        
+        /**
+         * 清除所有表情
+         */
+        clearAll: function() {
+          for(const index of Object.values(this.expressions)) {
+            if(index !== undefined) {
+              morphTargetInfluences[index] = 0;
+            }
+          }
+          this.currentExpression = null;
+        }
+      };
+    }
+
+    /**
+     * 开始随机眨眼动画
+     */
+    function startBlinking() {
+      if(!expressionAnimation || !autoAnimationEnabled) return;
+      
+      // 停止之前的眨眼定时器
+      if(blinkInterval) {
+        clearTimeout(blinkInterval);
+      }
+      
+      const blink = () => {
+        if(!autoAnimationEnabled || manualControlActive) return;
+        
+        const blinkDelay = 2000 + Math.random() * 3000;  // 2-5秒随机间隔
+        
+        blinkInterval = setTimeout(() => {
+          if(expressionAnimation.expressions.blink !== undefined && autoAnimationEnabled && !manualControlActive) {
+            // 快速眨眼
+            morphTargetInfluences[expressionAnimation.expressions.blink] = 1;
+            setTimeout(() => {
+              if(!manualControlActive) {
+                morphTargetInfluences[expressionAnimation.expressions.blink] = 0;
+              }
+            }, 100);
+          }
+          blink();  // 递归调用，继续下一次眨眼
+        }, blinkDelay);
+      };
+      
+      blink();
+    }
+
+    /**
+     * 停止随机眨眼动画
+     */
+    function stopBlinking() {
+      if(blinkInterval) {
+        clearTimeout(blinkInterval);
+        blinkInterval = null;
+      }
+    }
+
+    /**
+     * 播放模型内置动画
+     * @param {string} clipName - 动画名称
+     */
+    function playBuiltinAnimation(clipName) {
+      if(!mixer || !animationClips[clipName]) {
+        console.error('动画不存在:', clipName);
+        return;
+      }
+      
+      // 停止当前动画
+      if(currentAction) {
+        currentAction.fadeOut(0.5);
+      }
+      
+      // 停止说话动画
+      if(speechAnimation) {
+        speechAnimation.stopTalking();
+      }
+      stopBlinking();
+      
+      // 播放选中的动画
+      currentAction = mixer.clipAction(animationClips[clipName]);
+      currentAction.reset();
+      currentAction.fadeIn(0.5);
+      currentAction.play();
+      
+      animationMode = 'builtin';
+      manualControlActive = false;
+      
+      console.log(`✓ 播放内置动画: ${clipName}`);
+    }
+    
+    /**
+     * 停止模型内置动画
+     */
+    function stopBuiltinAnimation() {
+      if(currentAction) {
+        currentAction.fadeOut(0.5);
+        currentAction = null;
+      }
+      
+      animationMode = 'none';
+      console.log('✓ 已停止内置动画');
+    }
+    
+    /**
+     * 播放所有内置动画（循环播放）
+     */
+    function playAllBuiltinAnimations() {
+      if(!mixer || animations.length === 0) return;
+      
+      // 停止说话动画
+      if(speechAnimation) {
+        speechAnimation.stopTalking();
+      }
+      stopBlinking();
+      
+      // 停止当前动画
+      if(currentAction) {
+        currentAction.stop();
+      }
+      
+      // 播放所有动画并循环
+      animations.forEach((clip) => {
+        const action = mixer.clipAction(clip);
+        action.setLoop(THREE.LoopRepeat);
+        action.play();
+      });
+      
+      animationMode = 'builtin';
+      manualControlActive = false;
+      
+      console.log('✓ 播放所有内置动画（循环）');
+    }
+
+    /**
+     * 创建GUI控制面板
+     */
+    function createGUI() {
+      const gui = new lil.GUI();
+      gui.title('表情控制面板');
+      
+      // ========== 动画控制区 ==========
+      const animationFolder = gui.addFolder('动画控制');
+      animationFolder.add({ 
+        enabled: autoAnimationEnabled 
+      }, 'enabled').name('✅ 启用自动动画').onChange((value) => {
+        autoAnimationEnabled = value;
+        if(!value) {
+          // 关闭自动动画时，停止所有动画
+          animationMode = 'none';
+          if(speechAnimation) speechAnimation.stopTalking();
+          stopBlinking();
+          stopBuiltinAnimation();
+        } else {
+          // 开启自动动画时，根据当前模式决定启动哪种动画
+          manualControlActive = false;
+          // 默认不自动启动，让用户选择
+          console.log('✓ 自动动画已启用，请选择要播放的动画类型');
+        }
+      });
+      
+      animationFolder.add({ 
+        pauseAll: () => {
+          autoAnimationEnabled = false;
+          animationMode = 'none';
+          
+          // 停止说话动画
+          if(speechAnimation) speechAnimation.stopTalking();
+          stopBlinking();
+          
+          // 停止内置动画
+          stopBuiltinAnimation();
+          
+          manualControlActive = true;
+          console.log('✓ 已暂停所有动画，可以手动调节表情');
+        }
+      }, 'pauseAll').name('⏸️ 暂停所有动画');
+      
+      animationFolder.add({ 
+        resetAll: () => {
+          // 重置所有BlendShape
+          for(let i = 0; i < morphTargetInfluences.length; i++) {
+            morphTargetInfluences[i] = 0;
+          }
+          console.log('✓ 已重置所有表情');
+        }
+      }, 'resetAll').name('重置所有表情');
+      
+      animationFolder.open();
+      
+      // ========== 模型内置动画控制区 ==========
+      if(animations.length > 0) {
+        const builtinFolder = gui.addFolder('模型内置动画 🎬');
+        
+        // 添加动画选择下拉框
+        const animationNames = Object.keys(animationClips);
+        const animationControls = {
+          selectedAnimation: animationNames[0] || '',
+          
+          play: () => {
+            if(animationControls.selectedAnimation) {
+              autoAnimationEnabled = true;
+              playBuiltinAnimation(animationControls.selectedAnimation);
+            }
+          },
+          
+          stop: () => {
+            stopBuiltinAnimation();
+            manualControlActive = true;
+          },
+          
+          playAll: () => {
+            autoAnimationEnabled = true;
+            playAllBuiltinAnimations();
+          }
+        };
+        
+        // 动画选择器
+        if(animationNames.length > 0) {
+          builtinFolder.add(animationControls, 'selectedAnimation', animationNames).name('选择动画');
+          builtinFolder.add(animationControls, 'play').name('▶️ 播放选中动画');
+          builtinFolder.add(animationControls, 'stop').name('⏸️ 停止动画');
+          
+          if(animations.length > 1) {
+            builtinFolder.add(animationControls, 'playAll').name('🔁 循环播放所有动画');
+          }
+        }
+        
+        builtinFolder.open();
+      }
+      
+      // ========== 说话动画控制区 ==========
+      if(speechAnimation && Object.keys(speechAnimation.phonemes).length > 0) {
+        const speechFolder = gui.addFolder('说话动画');
+        speechFolder.add(speechAnimation, 'speed', 0.05, 0.5).name('说话速度');
+        speechFolder.add(speechAnimation, 'intensity', 0, 1).name('说话强度');
+        
+        speechFolder.add({ 
+          start: () => {
+            // 停止内置动画
+            stopBuiltinAnimation();
+            
+            autoAnimationEnabled = true;
+            manualControlActive = false;
+            animationMode = 'speech';
+            speechAnimation.startTalking();
+            startBlinking();
+          }
+        }, 'start').name('▶️ 开始说话');
+        
+        speechFolder.add({ 
+          stop: () => {
+            speechAnimation.stopTalking();
+            stopBlinking();
+            manualControlActive = true;
+            animationMode = 'none';
+          }
+        }, 'stop').name('⏸️ 停止说话');
+        
+        // 测试按钮
+        speechFolder.add({ 
+          test: () => {
+            autoAnimationEnabled = true;
+            manualControlActive = false;
+            speechAnimation.speak(['A', 'E', 'I', 'O', 'U']);
+          }
+        }, 'test').name('测试: A-E-I-O-U');
+      }
+      
+      // ========== 表情快捷控制区 ==========
+      if(expressionAnimation && Object.keys(expressionAnimation.expressions).length > 0) {
+        const expressionFolder = gui.addFolder('快捷表情');
+        expressionFolder.add(expressionAnimation, 'intensity', 0, 1).name('表情强度');
+        
+        for(const expr of Object.keys(expressionAnimation.expressions)) {
+          expressionFolder.add({ 
+            trigger: () => {
+              manualControlActive = true;
+              autoAnimationEnabled = false;
+              animationMode = 'none';
+              
+              // 停止所有动画
+              if(speechAnimation) speechAnimation.stopTalking();
+              stopBlinking();
+              stopBuiltinAnimation();
+              
+              // 应用表情
+              expressionAnimation.clearAll();
+              expressionAnimation.setExpression(expr);
+            }
+          }, 'trigger').name(getExpressionNameCN(expr));
+        }
+        
+        expressionFolder.add({ 
+          clear: () => {
+            expressionAnimation.clearAll();
+          }
+        }, 'clear').name('清除表情');
+      }
+      
+      // ========== 手动BlendShape控制区 ==========
+      const manualFolder = gui.addFolder('手动调节BlendShape');
+      if(morphTargetDictionary) {
+        // 创建实时绑定的控制对象
+        const liveControls = {};
+        
+        // 按索引排序
+        const sortedEntries = Object.entries(morphTargetDictionary).sort((a, b) => a[1] - b[1]);
+        
+        sortedEntries.forEach(([name, index]) => {
+          // 使用getter/setter实现实时双向绑定
+          Object.defineProperty(liveControls, name, {
+            get: () => morphTargetInfluences[index],
+            set: (value) => {
+              // 当手动调节时，自动暂停自动动画
+              if(!manualControlActive) {
+                manualControlActive = true;
+                autoAnimationEnabled = false;
+                if(speechAnimation) speechAnimation.stopTalking();
+                stopBlinking();
+                console.log('✓ 检测到手动调节，已自动暂停所有动画');
+              }
+              morphTargetInfluences[index] = value;
+            }
+          });
+          
+          // 添加滑块控制
+          manualFolder.add(liveControls, name, 0, 1, 0.01).name(`[${index}] ${name}`);
+        });
+      }
+      
+      // 默认打开手动控制面板
+      manualFolder.open();
+      gui.open();
+    }
+
+    /**
+     * 获取表情的中文名称
+     */
+    function getExpressionNameCN(expr) {
+      const nameMap = {
+        'smile': '微笑 😊',
+        'frown': '皱眉 😞',
+        'surprise': '惊讶 😮',
+        'anger': '愤怒 😠',
+        'blink': '眨眼 😉'
+      };
+      return nameMap[expr] || expr;
+    }
+
+    /**
+     * 窗口大小改变时的回调函数
+     */
+    function onWindowResize() {
+      // 更新相机宽高比
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      
+      // 更新渲染器尺寸
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    /**
+     * 动画循环函数：每帧调用
+     */
+    function animate() {
+      requestAnimationFrame(animate);  // 请求下一帧
+
+      // 更新时间增量
+      const delta = clock.getDelta();
+      
+      // 更新动画混合器（如果有GLTF动画）
+      if(mixer) mixer.update(delta);
+
+      // 渲染场景
+      renderer.render(scene, camera);
+      
+      // 更新轨道控制器
+      controls.update();
+    }
+  </script>
+</body>
+</html>
