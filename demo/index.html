@@ -20,9 +20,15 @@
   </style>
 </head>
 <body>
-  <div id="info">
+  <!-- <div id="info">
     three.js - MorphTarget 人脸表情动画<br/>
     使用右侧控制面板调节表情
+  </div> -->
+  <div id="audioControls" style="position:absolute; top:40px; left:10px; z-index:1; color:white; font-size:12px; line-height:18px;">
+    <label>上传音频驱动口型：</label>
+    <input id="audioFileInput" type="file" accept="audio/*" />
+    <br/>
+    <audio id="audioPlayer" controls style="width:260px; margin-top:4px;"></audio>
   </div>
 
   <!-- Three.js ES模块导入映射 -->
@@ -54,6 +60,14 @@
     let speechAnimation = null;             // 说话动画控制器
     let expressionAnimation = null;         // 表情动画控制器
     let blinkInterval = null;               // 眨眼定时器
+    let audioContext = null;                // 音频上下文
+    let audioAnalyser = null;               // 音频分析器
+    let audioTimeData = null;               // 时域数据缓存
+    let audioFreqData = null;               // 频域数据缓存
+    let audioSourceNode = null;             // 媒体源节点
+    let audioDriveEnabled = false;          // 是否启用音频驱动口型
+    let audioSmoothLevel = 0;               // 平滑后的音量
+    let audioPlayerEl = null;               // 音频播放器元素
     
     // ==================== 动画相关 ====================
     let animations = [];                    // 存储模型自带的所有动画
@@ -237,6 +251,9 @@
 
       // ========== 监听窗口大小变化 ==========
       window.addEventListener('resize', onWindowResize);
+
+      // ========== 初始化音频上传与播放 ==========
+      setupAudioUI();
     }
 
     /**
@@ -820,6 +837,22 @@
           }
         }, 'test').name('测试: A-E-I-O-U');
       }
+
+      // ========== 音频驱动口型 ==========
+      const audioFolder = gui.addFolder('音频驱动 (上传音频→口型)');
+      audioFolder.add({ 
+        start: () => {
+          startAudioDrivenSpeech();
+        }
+      }, 'start').name('▶️ 播放并驱动口型');
+      audioFolder.add({ 
+        stop: () => {
+          stopAudioDrivenSpeech();
+          manualControlActive = true;
+          animationMode = 'none';
+        }
+      }, 'stop').name('⏸️ 停止音频驱动');
+      audioFolder.open();
       
       // ========== 表情快捷控制区 ==========
       if(expressionAnimation && Object.keys(expressionAnimation.expressions).length > 0) {
@@ -926,11 +959,186 @@
       // 更新动画混合器（如果有GLTF动画）
       if(mixer) mixer.update(delta);
 
+      // 如果开启音频驱动，根据音频实时驱动口型
+      if(audioDriveEnabled && audioAnalyser && !manualControlActive) {
+        driveMouthByAudio();
+      }
+
       // 渲染场景
       renderer.render(scene, camera);
       
       // 更新轨道控制器
       controls.update();
+    }
+
+    /**
+     * 初始化音频上传与播放 UI
+     */
+    function setupAudioUI() {
+      audioPlayerEl = document.getElementById('audioPlayer');
+      const fileInput = document.getElementById('audioFileInput');
+
+      if(fileInput) {
+        fileInput.addEventListener('change', (e) => {
+          const file = e.target.files && e.target.files[0];
+          if(!file) return;
+          const url = URL.createObjectURL(file);
+          audioPlayerEl.src = url;
+          audioPlayerEl.load();
+          console.log('✓ 音频已选择，准备驱动口型');
+        });
+      }
+
+      if(audioPlayerEl) {
+        audioPlayerEl.addEventListener('ended', () => {
+          stopAudioDrivenSpeech();
+        });
+      }
+    }
+
+    /**
+     * 启动音频驱动口型
+     */
+    function startAudioDrivenSpeech() {
+      if(!audioPlayerEl || !audioPlayerEl.src) {
+        alert('请先上传音频文件');
+        return;
+      }
+      if(!headMesh || !morphTargetInfluences) {
+        alert('模型未加载完成，无法驱动口型');
+        return;
+      }
+
+      // 停止其它动画
+      stopBuiltinAnimation();
+      if(speechAnimation) speechAnimation.stopTalking();
+      stopBlinking();
+
+      // 确保 AudioContext
+      if(!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
+
+      // 重建音频节点链路
+      if(audioSourceNode) {
+        audioSourceNode.disconnect();
+      }
+      audioSourceNode = audioContext.createMediaElementSource(audioPlayerEl);
+
+      audioAnalyser = audioContext.createAnalyser();
+      audioAnalyser.fftSize = 2048;
+      audioTimeData = new Uint8Array(audioAnalyser.fftSize);
+      audioFreqData = new Uint8Array(audioAnalyser.frequencyBinCount);
+
+      // 链接：source -> analyser -> destination
+      audioSourceNode.connect(audioAnalyser);
+      audioAnalyser.connect(audioContext.destination);
+
+      // 播放音频
+      audioPlayerEl.play();
+      audioDriveEnabled = true;
+      autoAnimationEnabled = true;
+      manualControlActive = false;
+      animationMode = 'speech';
+
+      // 同步眨眼
+      startBlinking();
+
+      console.log('✓ 已启动音频驱动口型');
+    }
+
+    /**
+     * 停止音频驱动口型
+     */
+    function stopAudioDrivenSpeech() {
+      audioDriveEnabled = false;
+      animationMode = 'none';
+      if(audioPlayerEl) {
+        audioPlayerEl.pause();
+      }
+      // 重置嘴型
+      if(speechAnimation) speechAnimation.resetMouth && speechAnimation.resetMouth();
+    }
+
+    /**
+     * 根据音频实时驱动口型
+     */
+    function driveMouthByAudio() {
+      audioAnalyser.getByteTimeDomainData(audioTimeData);
+      audioAnalyser.getByteFrequencyData(audioFreqData);
+
+      // 计算音量（RMS）
+      let sum = 0;
+      for(let i = 0; i < audioTimeData.length; i++) {
+        const v = (audioTimeData[i] - 128) / 128; // -1~1
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / audioTimeData.length); // 0~1
+
+      // 计算频谱重心（简化的音素倾向）
+      let centroidNum = 0;
+      let centroidDen = 0;
+      for(let i = 0; i < audioFreqData.length; i++) {
+        const mag = audioFreqData[i];
+        centroidNum += mag * i;
+        centroidDen += mag;
+      }
+      const centroid = centroidDen > 0 ? (centroidNum / centroidDen) : 0;
+      const normCentroid = centroid / audioFreqData.length; // 0~1
+
+      // 平滑音量，避免口型抖动
+      audioSmoothLevel = audioSmoothLevel * 0.8 + rms * 0.2;
+
+      // 根据音量确定开口强度
+      const mouthOpen = THREE.MathUtils.clamp(audioSmoothLevel * 2.5, 0, 1);
+
+      // 根据频谱重心选择更合适的音素（粗略映射）
+      let targetPhoneme = 'A'; // 默认开口
+      if(normCentroid > 0.6) {
+        targetPhoneme = 'I'; // 高频多，趋向窄口
+      } else if(normCentroid < 0.25) {
+        targetPhoneme = 'U'; // 低频占比高，趋向圆口/闭口
+      } else if(normCentroid < 0.45) {
+        targetPhoneme = 'O'; // 中低频
+      } else {
+        targetPhoneme = 'E'; // 中高频
+      }
+
+      applyAudioPhonemePose(targetPhoneme, mouthOpen);
+    }
+
+    /**
+     * 将音频分析结果映射到BlendShape
+     */
+    function applyAudioPhonemePose(phoneme, intensity) {
+      if(!speechAnimation || !speechAnimation.phonemes) return;
+
+      const indices = speechAnimation.phonemes;
+      const targetIndex = indices[phoneme] !== undefined ? indices[phoneme] : indices['A'];
+      const blinkIndex = expressionAnimation && expressionAnimation.expressions ? expressionAnimation.expressions.blink : undefined;
+
+      // 先清空所有音素相关权重
+      for(const idx of Object.values(indices)) {
+        if(idx !== undefined) morphTargetInfluences[idx] = 0;
+      }
+
+      // 应用目标音素
+      if(targetIndex !== undefined) {
+        morphTargetInfluences[targetIndex] = intensity;
+      }
+
+      // 轻微随机偏移模拟自然口型变化
+      const altPhonemes = ['A','E','I','O','U','M'].filter(p => p !== phoneme && indices[p] !== undefined);
+      if(altPhonemes.length > 0 && intensity > 0.15) {
+        const alt = altPhonemes[Math.floor(Math.random() * altPhonemes.length)];
+        const altIdx = indices[alt];
+        morphTargetInfluences[altIdx] = intensity * 0.2;
+      }
+
+      // 保留眨眼的权重（如有）
+      if(blinkIndex !== undefined && morphTargetInfluences[blinkIndex] > 0.8) {
+        morphTargetInfluences[blinkIndex] = 1;
+      }
     }
   </script>
 </body>
