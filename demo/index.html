@@ -17,6 +17,68 @@
       color: white; 
       z-index: 1; 
     }
+    #chatPanel {
+      position: absolute;
+      left: 10px;
+      bottom: 16px;
+      width: 340px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      backdrop-filter: blur(4px);
+      z-index: 2;
+    }
+    #chatPanel h3 {
+      margin: 0 0 6px 0;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    #chatLog {
+      max-height: 180px;
+      overflow-y: auto;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 6px;
+      padding: 8px;
+      margin-bottom: 8px;
+    }
+    .chat-msg {
+      margin-bottom: 6px;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+    .chat-msg.user { color: #c7ff9c; }
+    .chat-msg.bot { color: #9cd6ff; }
+    .chat-msg.system { color: #ffd28c; }
+    #chatInputRow {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    #userTextInput {
+      flex: 1;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(0,0,0,0.35);
+      color: #fff;
+    }
+    #sendTextBtn, #micBtn {
+      padding: 6px 10px;
+      border: none;
+      border-radius: 6px;
+      background: #3a86ff;
+      color: #fff;
+      cursor: pointer;
+    }
+    #micBtn.listening { background: #ff7b00; }
+    #chatStatus {
+      font-size: 12px;
+      opacity: 0.85;
+      margin-top: 4px;
+    }
   </style>
 </head>
 <body>
@@ -29,6 +91,21 @@
     <input id="audioFileInput" type="file" accept="audio/*" />
     <br/>
     <audio id="audioPlayer" controls style="width:260px; margin-top:4px;"></audio>
+  </div>
+  <div id="photoControls" style="position:absolute; top:120px; left:10px; z-index:1; color:white; font-size:12px; line-height:18px;">
+    <label>上传头像贴图：</label>
+    <input id="photoFileInput" type="file" accept="image/*" />
+    <div style="opacity:0.85;">应用到头部材质，快速换脸</div>
+  </div>
+  <div id="chatPanel">
+    <h3>虚拟人对话</h3>
+    <div id="chatLog"></div>
+    <div id="chatInputRow">
+      <button id="micBtn" title="语音输入">🎤 语音</button>
+      <input id="userTextInput" type="text" placeholder="输入文字后回车或点击发送" />
+      <button id="sendTextBtn">发送</button>
+    </div>
+    <div id="chatStatus"></div>
   </div>
 
   <!-- Three.js ES模块导入映射 -->
@@ -60,6 +137,7 @@
     let speechAnimation = null;             // 说话动画控制器
     let expressionAnimation = null;         // 表情动画控制器
     let blinkInterval = null;               // 眨眼定时器
+    let headMeshScore = -1;                 // 记录当前选中网格的评分，用于优选头部
     let audioContext = null;                // 音频上下文
     let audioAnalyser = null;               // 音频分析器
     let audioTimeData = null;               // 时域数据缓存
@@ -68,11 +146,26 @@
     let audioDriveEnabled = false;          // 是否启用音频驱动口型
     let audioSmoothLevel = 0;               // 平滑后的音量
     let audioPlayerEl = null;               // 音频播放器元素
+    const textureLoader = new THREE.TextureLoader(); // 贴图加载器
     
     // ==================== 动画相关 ====================
     let animations = [];                    // 存储模型自带的所有动画
     let currentAction = null;               // 当前播放的动画动作
     let animationClips = {};                // 动画剪辑映射表
+    
+    // ==================== 对话与语音交互相关 ====================
+    const llmConfig = {
+      endpoint: 'https://api.deepseek.com/chat/completions', // 替换为你的大模型接口
+      apiKey: 'xxxxxx', // TODO: 在此填入自己的密钥
+      model: 'deepseek-chat',
+      systemPrompt: '你是一名友好的虚拟人，用简洁中文回复用户，回复不要带有表情符号。'
+    };
+    let chatHistory = [
+      { role: 'system', content: llmConfig.systemPrompt }
+    ];
+    let recognition = null;                 // Web Speech API 识别实例
+    let isListening = false;                // 是否正在录音识别
+    let ttsUtterance = null;                // 当前的语音合成对象
     
     // ==================== 动画控制开关 ====================
     let autoAnimationEnabled = false;       // 自动动画总开关（默认关闭）
@@ -254,6 +347,12 @@
 
       // ========== 初始化音频上传与播放 ==========
       setupAudioUI();
+
+      // ========== 初始化头像贴图上传 ==========
+      setupPhotoUI();
+
+      // ========== 初始化对话/语音交互 UI ==========
+      setupChatUI();
     }
 
     /**
@@ -299,6 +398,7 @@
       }
       
       const morphAttributes = child.geometry.morphAttributes;
+      console.log(child.morphTargetDictionary)
       
       // 检查position类型的morph attributes（最常见）
       if(!morphAttributes.position || morphAttributes.position.length === 0) {
@@ -332,9 +432,14 @@
         }
       }
       
-      // ===== 使用第一个找到的包含BlendShape的网格 =====
-      if(!headMesh) {
+      // ===== 选择最优的头部网格（优先名字包含 head/face，或BlendShape数量更多）=====
+      const nameLower = (child.name || '').toLowerCase();
+      const isHeadLike = /head|face/.test(nameLower);
+      const candidateScore = (isHeadLike ? 1000 : 0) + morphCount;
+
+      if(!headMesh || candidateScore > headMeshScore) {
         headMesh = child;
+        headMeshScore = candidateScore;
         morphTargetInfluences = child.morphTargetInfluences;
         morphTargetDictionary = child.morphTargetDictionary;
         
@@ -358,11 +463,12 @@
 
       // 常见音素对应的BlendShape名称（可根据实际模型调整）
       const phonemes = {
+        // Ready Player Me 常见：mouthOpen / mouthSmile
         'A': ['A', 'a', 'ah', 'open', 'jawOpen', 'mouthOpen', 'aa'],
-        'E': ['E', 'e', 'eh', 'smile', 'mouthSmile', 'ee'],
-        'I': ['I', 'i', 'ee', 'mouthNarrow', 'ii'],
-        'O': ['O', 'o', 'oh', 'mouthRound', 'oo'],
-        'U': ['U', 'u', 'oo', 'mouthPucker', 'uu'],
+        'E': ['E', 'e', 'eh', 'smile', 'mouthSmile', 'ee', 'mouthSmile_L', 'mouthSmile_R'],
+        'I': ['I', 'i', 'ee', 'mouthNarrow', 'ii', 'mouthSmile'],
+        'O': ['O', 'o', 'oh', 'mouthRound', 'oo', 'mouthOpen'],
+        'U': ['U', 'u', 'oo', 'mouthPucker', 'uu', 'mouthOpen'],
         'M': ['M', 'm', 'mouthClose', 'lipsTogether', 'pp'],
       };
 
@@ -517,11 +623,11 @@
 
       // 常见表情对应的BlendShape名称
       const expressions = {
-        'smile': ['smile', 'happy', 'joy', 'grin', 'mouthSmile'],
+        'smile': ['smile', 'happy', 'joy', 'grin', 'mouthSmile', 'mouthSmile_L', 'mouthSmile_R'],
         'frown': ['frown', 'sad', 'sadness', 'mouthFrown'],
-        'surprise': ['surprise', 'surprised', 'shock', 'eyebrowUp', 'browUp'],
+        'surprise': ['surprise', 'surprised', 'shock', 'eyebrowUp', 'browUp', 'jawOpen', 'mouthOpen'],
         'anger': ['anger', 'angry', 'mad', 'furious', 'browDown'],
-        'blink': ['blink', 'wink', 'eyeClose', 'eyesClosed'],
+        'blink': ['blink', 'wink', 'eyeClose', 'eyesClosed', 'eyeBlink_L', 'eyeBlink_R'],
       };
 
       // 查找表情对应的BlendShape索引
@@ -997,6 +1103,79 @@
     }
 
     /**
+     * 初始化头像贴图上传 UI
+     */
+    function setupPhotoUI() {
+      const photoInput = document.getElementById('photoFileInput');
+      if(!photoInput) return;
+
+      photoInput.addEventListener('change', (e) => {
+        const file = e.target.files && e.target.files[0];
+        if(!file) return;
+        const url = URL.createObjectURL(file);
+        applyPhotoTexture(url);
+      });
+    }
+
+    /**
+     * 将上传的图片作为贴图应用到头部网格
+     */
+    function applyPhotoTexture(url) {
+      if(!headMesh) {
+        alert('模型尚未加载或未找到头部网格');
+        return;
+      }
+
+      textureLoader.load(
+        url,
+        (texture) => {
+          // GLTF 默认期望贴图不翻转
+          texture.flipY = false;
+          texture.colorSpace = THREE.SRGBColorSpace;
+
+          const applyMap = (mat) => {
+            if(!mat) return;
+            // 避免与其他网格共享材质，先克隆一次
+            if(!mat.userData._cloned) {
+              const cloned = mat.clone();
+              cloned.userData._cloned = true;
+              return cloned;
+            }
+            return mat;
+          };
+
+          if(Array.isArray(headMesh.material)) {
+            headMesh.material = headMesh.material.map((m) => {
+              const mat = applyMap(m);
+              if(mat) {
+                mat.map = texture;
+                mat.needsUpdate = true;
+              }
+              return mat;
+            });
+          } else {
+            const mat = applyMap(headMesh.material);
+            if(mat) {
+              mat.map = texture;
+              mat.needsUpdate = true;
+              headMesh.material = mat;
+            }
+          }
+
+          // 尝试对与头部同材质的 Teeth/Eye 等不处理，聚焦头部
+          console.log('✓ 已应用头像贴图到头部网格');
+          URL.revokeObjectURL(url);
+        },
+        undefined,
+        (err) => {
+          console.error('✗ 贴图加载失败', err);
+          alert('贴图加载失败，请重试');
+          URL.revokeObjectURL(url);
+        }
+      );
+    }
+
+    /**
      * 启动音频驱动口型
      */
     function startAudioDrivenSpeech() {
@@ -1139,6 +1318,233 @@
       if(blinkIndex !== undefined && morphTargetInfluences[blinkIndex] > 0.8) {
         morphTargetInfluences[blinkIndex] = 1;
       }
+    }
+
+    // ======================================================
+    // =============== 文本/语音 对话交互 ====================
+    // ======================================================
+
+    /**
+     * 初始化对话 UI、事件绑定
+     */
+    function setupChatUI() {
+      const sendBtn = document.getElementById('sendTextBtn');
+      const micBtn = document.getElementById('micBtn');
+      const input = document.getElementById('userTextInput');
+
+      appendChatMsg('system', '你好！我是你的AI虚拟人，可以通过文字或语音和我聊天。');
+
+      sendBtn?.addEventListener('click', () => handleUserMessage(input.value));
+      input?.addEventListener('keydown', (e) => {
+        if(e.key === 'Enter') {
+          handleUserMessage(input.value);
+        }
+      });
+
+      micBtn?.addEventListener('click', toggleMic);
+
+      setupSpeechRecognition();
+    }
+
+    /**
+     * 处理用户输入
+     */
+    async function handleUserMessage(text) {
+      const trimmed = (text || '').trim();
+      if(!trimmed) return;
+
+      const input = document.getElementById('userTextInput');
+      input.value = '';
+
+      appendChatMsg('user', trimmed);
+      chatHistory.push({ role: 'user', content: trimmed });
+      setChatStatus('虚拟人正在思考...');
+      setChatBusy(true);
+
+      try {
+        const reply = await queryLLM(trimmed);
+        appendChatMsg('bot', reply);
+        chatHistory.push({ role: 'assistant', content: reply });
+        speakText(reply);
+      } catch (err) {
+        console.error(err);
+        appendChatMsg('system', '调用大模型失败，请检查 API Key 或网络。');
+      } finally {
+        setChatBusy(false);
+        setChatStatus('');
+      }
+    }
+
+    /**
+     * 调用大模型接口，返回回复文本
+     */
+    async function queryLLM(userText) {
+      if(!llmConfig.apiKey || llmConfig.apiKey === 'YOUR_API_KEY') {
+        throw new Error('未配置大模型 API Key');
+      }
+
+      const body = {
+        model: llmConfig.model,
+        messages: chatHistory.slice(-10).concat({ role: 'user', content: userText }),
+        temperature: 0.7
+      };
+
+      const res = await fetch(llmConfig.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${llmConfig.apiKey}`
+        },
+        body: JSON.stringify(body)
+      });
+
+      if(!res.ok) {
+        const errText = await res.text();
+        throw new Error(`LLM 请求失败: ${res.status} ${errText}`);
+      }
+
+      const data = await res.json();
+      const reply = data?.choices?.[0]?.message?.content || '抱歉，我暂时无法回答。';
+      return reply;
+    }
+
+    /**
+     * 语音合成说话，同时驱动口型
+     */
+    function speakText(text) {
+      if(!('speechSynthesis' in window)) {
+        console.warn('浏览器不支持语音合成');
+        return;
+      }
+
+      // 停止上一条
+      window.speechSynthesis.cancel();
+      ttsUtterance = new SpeechSynthesisUtterance(text);
+      ttsUtterance.lang = 'zh-CN';
+      ttsUtterance.rate = 1.0;
+      ttsUtterance.pitch = 1.0;
+
+      ttsUtterance.onstart = () => {
+        startMouthWhileSpeaking();
+      };
+      ttsUtterance.onend = () => {
+        stopMouthAfterSpeaking();
+      };
+      ttsUtterance.onerror = () => {
+        stopMouthAfterSpeaking();
+      };
+
+      window.speechSynthesis.speak(ttsUtterance);
+    }
+
+    /**
+     * 启动/停止麦克风识别
+     */
+    function toggleMic() {
+      if(!recognition) {
+        alert('当前浏览器不支持语音识别，请使用 Chrome 桌面版。');
+        return;
+      }
+
+      if(isListening) {
+        recognition.stop();
+      } else {
+        recognition.start();
+      }
+    }
+
+    /**
+     * 初始化语音识别
+     */
+    function setupSpeechRecognition() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if(!SpeechRecognition) {
+        console.warn('浏览器不支持 SpeechRecognition');
+        return;
+      }
+
+      recognition = new SpeechRecognition();
+      recognition.lang = 'zh-CN';
+      recognition.continuous = false;
+      recognition.interimResults = false;
+
+      recognition.onstart = () => {
+        isListening = true;
+        setMicButtonState(true);
+        setChatStatus('正在聆听...');
+      };
+      recognition.onend = () => {
+        isListening = false;
+        setMicButtonState(false);
+        setChatStatus('');
+      };
+      recognition.onerror = (e) => {
+        console.error('识别错误', e);
+        isListening = false;
+        setMicButtonState(false);
+        setChatStatus('语音识别出错，请重试');
+      };
+      recognition.onresult = (event) => {
+        if(!event.results || event.results.length === 0) return;
+        const text = event.results[0][0].transcript;
+        const input = document.getElementById('userTextInput');
+        input.value = text;
+        handleUserMessage(text);
+      };
+    }
+
+    /**
+     * 聊天记录显示
+     */
+    function appendChatMsg(role, text) {
+      const log = document.getElementById('chatLog');
+      if(!log) return;
+      const div = document.createElement('div');
+      div.className = `chat-msg ${role}`;
+      div.textContent = `${role === 'user' ? '你' : role === 'bot' ? '虚拟人' : '系统'}：${text}`;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function setChatStatus(text) {
+      const el = document.getElementById('chatStatus');
+      if(el) el.textContent = text || '';
+    }
+
+    function setChatBusy(busy) {
+      const sendBtn = document.getElementById('sendTextBtn');
+      const micBtn = document.getElementById('micBtn');
+      const input = document.getElementById('userTextInput');
+      [sendBtn, micBtn, input].forEach((el) => {
+        if(el) el.disabled = !!busy;
+      });
+    }
+
+    function setMicButtonState(listening) {
+      const micBtn = document.getElementById('micBtn');
+      if(!micBtn) return;
+      micBtn.classList.toggle('listening', listening);
+      micBtn.textContent = listening ? '🛑 停止' : '🎤 语音';
+    }
+
+    /**
+     * 让虚拟人口型随语音合成简单摆动
+     */
+    function startMouthWhileSpeaking() {
+      if(!speechAnimation) return;
+      autoAnimationEnabled = true;
+      manualControlActive = false;
+      animationMode = 'speech';
+      speechAnimation.startTalking();
+      startBlinking();
+    }
+
+    function stopMouthAfterSpeaking() {
+      if(!speechAnimation) return;
+      speechAnimation.stopTalking();
+      stopBlinking();
+      manualControlActive = true;
+      animationMode = 'none';
     }
   </script>
 </body>
